@@ -14,6 +14,29 @@ from clothing_mask import ClothingMask, restore_crop
 
 
 class ClothingMaskTests(unittest.TestCase):
+    def test_long_target_rejects_exposed_forearm_and_accepts_fabric(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=.5,y=.5,visibility=0.,presence=0.) for _ in range(33)]
+        points[13]=SimpleNamespace(x=.77,y=.5,visibility=1.,presence=1.)
+        points[15]=SimpleNamespace(x=.78,y=.72,visibility=1.,presence=1.)
+        garment=Image.new('RGB',(100,200),'white')
+        garment.info['garment_silhouette']=Image.new('L',garment.size,255)
+        self.labels[190:300,220:250]=14
+        report=self.masker.check_sleeve_coverage(self.person,points,garment)
+        self.assertTrue(report['available'])
+        self.assertFalse(report['passed'])
+        self.labels[190:300,220:250]=7
+        self.assertTrue(self.masker.check_sleeve_coverage(self.person,points,garment)['passed'])
+
+    def test_short_sleeve_target_can_leave_forearms_exposed(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=.5,y=.5,visibility=1.,presence=1.) for _ in range(33)]
+        garment=Image.new('RGB',(200,240),'white')
+        silhouette=Image.new('L',garment.size)
+        silhouette.paste(255,(40,10,160,230));silhouette.paste(255,(0,20,200,80))
+        garment.info['garment_silhouette']=silhouette
+        self.assertTrue(self.masker.check_sleeve_coverage(self.person,points,garment)['passed'])
+
     def test_restore_exposed_skin_keeps_new_sleeves(self):
         from unittest.mock import patch
         original = Image.new('RGB',(30,30),(204,138,110))
@@ -25,6 +48,20 @@ class ClothingMaskTests(unittest.TestCase):
             result = self.masker.restore_exposed_skin(original,preview)
         self.assertEqual(result.getpixel((22,15)),original.getpixel((22,15)))
         self.assertEqual(result.getpixel((8,15)),preview.getpixel((8,15)))
+
+    def test_skin_restoration_does_not_reintroduce_old_cuff(self):
+        from unittest.mock import patch
+        source=Image.new('RGB',(100,100),(20,25,35))
+        preview=Image.new('RGB',(100,100),'white')
+        original_labels=np.zeros((100,100),dtype=np.uint8)
+        original_labels[10:50,20:80]=5
+        original_labels[50:90,30:70]=14
+        preview_labels=np.zeros_like(original_labels)
+        preview_labels[40:95,20:80]=14
+        with patch.object(self.masker,'_labels',side_effect=[original_labels,preview_labels]):
+            result=self.masker.restore_exposed_skin(source,preview)
+        self.assertEqual(result.getpixel((50,50)),(255,255,255))
+        self.assertEqual(result.getpixel((50,75)),source.getpixel((50,75)))
 
     def setUp(self):
         self.labels = np.zeros((400, 300), dtype=np.uint8)
@@ -75,6 +112,76 @@ class ClothingMaskTests(unittest.TestCase):
         self.assertEqual(person.size, (384, 512))
         self.assertEqual(mask.size, (384, 512))
 
+    def test_short_target_sleeves_preserve_exposed_forearms(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=0.,y=0.,visibility=0.,presence=0.) for _ in range(33)]
+        for i,x,y in ((11,210,110),(12,90,110),(13,230,200),(15,235,288)):
+            points[i]=SimpleNamespace(x=x/299,y=y/399,visibility=1.,presence=1.)
+        self.labels[124:290,221:245]=14
+        garment=Image.new('RGB',(200,240),'white')
+        silhouette=Image.new('L',garment.size)
+        silhouette.paste(255,(40,10,160,230))
+        silhouette.paste(255,(0,20,200,80))
+        garment.info['garment_silhouette']=silhouette
+        _,mask,box,protected=self.masker.prepare(self.person,'upper',(384,512),
+            landmarks=points,garment=garment,include_protection=True)
+        result=restore_crop(Image.new('RGB',mask.size,'blue'),self.person,mask,box,protected)
+        self.assertEqual(result.getpixel((233,255)),self.person.getpixel((233,255)))
+        self.assertEqual(result.getpixel((150,180)),(0,0,255))
+
+    def test_short_target_removes_source_cuff_mislabelled_as_skin(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=0.,y=0.,visibility=0.,presence=0.) for _ in range(33)]
+        for i,x,y in ((11,210,110),(12,90,110),(13,235,215),(15,237,288)):
+            points[i]=SimpleNamespace(x=x/299,y=y/399,visibility=1.,presence=1.)
+        self.labels[120:194,215:250]=5
+        self.labels[194:290,220:247]=14
+        garment=Image.new('RGB',(200,240),'white')
+        silhouette=Image.new('L',garment.size)
+        silhouette.paste(255,(40,10,160,230));silhouette.paste(255,(0,20,200,80))
+        garment.info['garment_silhouette']=silhouette
+        _,mask,box,protected=self.masker.prepare(self.person,'upper',(384,512),
+            landmarks=points,garment=garment,include_protection=True)
+        result=restore_crop(Image.new('RGB',mask.size,'white'),self.person,mask,box,protected)
+        self.assertEqual(result.getpixel((234,196)),(255,255,255))
+        self.assertEqual(result.getpixel((234,255)),self.person.getpixel((234,255)))
+
+    def test_short_bottoms_preserve_existing_bare_legs(self):
+        self.labels[300:355,110:190]=16
+        garment=Image.new('RGB',(200,140),'white')
+        garment.info['garment_silhouette']=Image.new('L',garment.size,255)
+        _,mask,box,protected=self.masker.prepare(self.person,'lower',(384,512),
+            garment=garment,include_protection=True)
+        result=restore_crop(Image.new('RGB',mask.size,'blue'),self.person,mask,box,protected)
+        self.assertEqual(result.getpixel((150,320)),self.person.getpixel((150,320)))
+        self.assertEqual(result.getpixel((150,280)),(0,0,255))
+
+    def test_long_sleeved_target_keeps_full_body_context_when_ankles_are_visible(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=.5,y=.5,visibility=0.,presence=0.) for _ in range(33)]
+        for i,x,y in ((0,.5,.15),(11,.7,.27),(12,.3,.27),(13,.77,.5),
+                      (14,.23,.5),(15,.78,.7),(16,.22,.7),(23,.6,.65),(24,.4,.65),
+                      (27,.6,.94),(28,.4,.94)):
+            points[i]=SimpleNamespace(x=x,y=y,visibility=1.,presence=1.)
+        garment=Image.new('RGB',(200,240),'white')
+        garment.info['garment_silhouette']=Image.new('L',garment.size,255)
+        _,_,box=self.masker.prepare(self.person,'upper',(384,512),landmarks=points,garment=garment)
+        self.assertLessEqual(box[0],0)
+        self.assertLessEqual(box[1],0)
+        self.assertGreaterEqual(box[2],self.person.width)
+        self.assertGreaterEqual(box[3],self.person.height)
+
+    def test_wide_photo_crop_contains_all_editable_pixels(self):
+        labels=np.zeros((160,600),dtype=np.uint8)
+        labels[30:120,40:560]=5
+        self.masker.parser=lambda image:Image.fromarray(labels)
+        image=Image.new('RGB',(600,160),'red')
+        _,mask,box,protected=self.masker.prepare(image,'upper',(384,512),include_protection=True)
+        self.assertLess(box[1],0)
+        result=restore_crop(Image.new('RGB',mask.size,'blue'),image,mask,box,protected)
+        for point in ((45,70),(555,70),(300,70)):
+            self.assertEqual(result.getpixel(point),(0,0,255))
+
     def test_hands_near_shirt_are_preserved(self):
         self.labels[215:270, 215:235] = 14
         person, mask, box = self.masker.prepare(self.person, 'upper')
@@ -92,8 +199,22 @@ class ClothingMaskTests(unittest.TestCase):
             self.person,'upper',(384,512),landmarks=points,include_protection=True)
         result = restore_crop(Image.new('RGB',mask.size,'blue'),self.person,mask,box,protected)
         self.assertEqual(result.getpixel((233,255)),(0,0,255))
-        for point in ((238,301),(250,255),(150,320),(150,60)):
+        for point in ((238,301),(270,255),(150,320),(150,60)):
             self.assertEqual(result.getpixel(point),self.person.getpixel(point))
+
+    def test_long_sleeves_have_fabric_space_beyond_bare_forearm(self):
+        from types import SimpleNamespace
+        points=[SimpleNamespace(x=0.,y=0.,visibility=0.,presence=0.) for _ in range(33)]
+        for i,x,y in ((11,210,110),(12,90,110),(13,230,200),(15,235,288),(17,237,307),(19,240,304)):
+            points[i]=SimpleNamespace(x=x/299,y=y/399,visibility=1.,presence=1.)
+        self.labels[124:310,221:245]=14
+        foreground=Image.fromarray((self.labels>0).astype(np.float32))
+        _,mask,box,protected=self.masker.prepare(self.person,'upper',(384,512),
+            landmarks=points,include_protection=True,foreground=foreground)
+        result=restore_crop(Image.new('RGB',mask.size,'blue'),self.person,mask,box,protected)
+        self.assertEqual(result.getpixel((251,255)),(0,0,255))
+        self.assertEqual(result.getpixel((275,255)),self.person.getpixel((275,255)))
+        self.assertEqual(result.getpixel((238,301)),self.person.getpixel((238,301)))
 
     def test_restore_does_not_blend_original_garment_colour(self):
         _, mask, box = self.masker.prepare(self.person, 'upper')

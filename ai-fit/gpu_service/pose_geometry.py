@@ -12,6 +12,62 @@ def visible(point, minimum=.5):
                 and 0 <= point.x <= 1 and 0 <= point.y <= 1)
 
 
+def neck_protection(points, size, labels):
+    """Keep visible source neck skin above the shoulder line at source coordinates."""
+    width,height=size
+    result=np.zeros((height,width),dtype=np.uint8)
+    if points is None or len(points)!=33 or not all(visible(points[i],.5) for i in (11,12)):
+        return result
+    shoulder_x=(points[11].x+points[12].x)*width/2
+    shoulder_y=(points[11].y+points[12].y)*height/2
+    span=np.hypot((points[11].x-points[12].x)*width,(points[11].y-points[12].y)*height)
+    rows,columns=np.ogrid[:height,:width]
+    neck=(np.abs(columns-shoulder_x)<span*.22)&(rows<shoulder_y+span*.04)
+    # Parsing sometimes calls neck skin an arm, so preserve all skin classes
+    # within this anatomically bounded region, without retaining shirt fabric.
+    result[neck & np.isin(labels,(13,14,15))]=255
+    return result
+
+
+def body_width_difference(before, after, points, size):
+    """Compare torso silhouette widths without inferring body measurements."""
+    width,height=size
+    if points is None or len(points)!=33 or not all(visible(points[i],.5) for i in (11,12,23,24)):
+        return {'passed': True, 'available': False, 'ratios': []}
+    source=np.asarray(before.resize(size),dtype=np.float32)>.5
+    output=np.asarray(after.resize(size),dtype=np.float32)>.5
+    shoulder_y=(points[11].y+points[12].y)*height/2
+    hip_y=(points[23].y+points[24].y)*height/2
+    ratios=[]
+    band=max(1,round((hip_y-shoulder_y)*.015))
+    for fraction in (.35,.50,.65,.80):
+        row=round(shoulder_y+(hip_y-shoulder_y)*fraction)
+        if not 0 <= row < height:
+            continue
+        center=round(((points[11].x+points[12].x)*(1-fraction)
+                      +(points[23].x+points[24].x)*fraction)*width/2)
+        widths=[]
+        for mask in (source,output):
+            section=[]
+            for y in range(max(0,row-band),min(height,row+band+1)):
+                line=mask[y]
+                if not 0 <= center < width or not line[center]:
+                    section.append(0)
+                    continue
+                left=right=center
+                while left>0 and line[left-1]:left-=1
+                while right+1<width and line[right+1]:right+=1
+                section.append(right-left+1)
+            widths.append(float(np.median(section)))
+        if widths[0]>=10:
+            ratios.append(widths[1]/widths[0])
+    # Multiple sections must agree before rejecting a narrower silhouette.
+    # A single row can be affected by crossed arms or a garment opening.
+    narrowed=sum(ratio<.82 for ratio in ratios)
+    available=len(ratios)>=3
+    return {'passed': available and narrowed<2, 'available': available, 'ratios': ratios}
+
+
 def hand_protection(points, size, *, protect_wrist=False):
     width, height = size
     result=np.zeros((height,width),dtype=np.uint8)
@@ -61,7 +117,19 @@ def pose_difference(before, after, size, category):
             missing.append(i);continue
         movement[i]=float(np.hypot((before[i].x-after[i].x)*width,(before[i].y-after[i].y)*height)/scale)
     shifted=[i for i,v in movement.items() if v > (.22 if i in (13,14,15,16,27,28) else .28)]
-    return {'passed':not missing and not shifted,'missing':missing,'shifted':shifted,'displacement':movement}
+    neck_changed=False
+    neck_ratio=None
+    if all(visible(p[i],.5) for p in (before,after) for i in (9,10,11,12)):
+        before_mouth=(before[9].y+before[10].y)*height/2
+        after_mouth=(after[9].y+after[10].y)*height/2
+        original_length=shoulder[1]-before_mouth
+        output_length=(after[11].y+after[12].y)*height/2-after_mouth
+        if original_length>scale*.03:
+            neck_ratio=float(output_length/original_length)
+            neck_changed=output_length-original_length>max(scale*.06,original_length*.25)
+    return {'passed':not missing and not shifted and not neck_changed,'missing':missing,
+            'shifted':shifted,'displacement':movement,'neck_changed':bool(neck_changed),
+            'neck_ratio':neck_ratio}
 
 
 def leg_corridor(points, size):
@@ -114,7 +182,7 @@ def upper_arm_editable(points, size):
     return mask
 
 
-def sleeve_corridor(points, size):
+def sleeve_corridor(points, size, *, long_sleeves=True):
     """Make the visible arm available to short- and long-sleeve inpainting."""
     width,height = size
     mask = np.zeros((height,width),dtype=np.uint8)
@@ -124,6 +192,13 @@ def sleeve_corridor(points, size):
                     (points[11].y-points[12].y)*height)
     for indices in ((11,13,15),(12,14,16)):
         shoulder,elbow,wrist = (points[i] for i in indices)
+        if not long_sleeves:
+            if visible(shoulder,.4) and visible(elbow,.4):
+                start = (round(shoulder.x*(width-1)),round(shoulder.y*(height-1)))
+                end = (round((shoulder.x+.6*(elbow.x-shoulder.x))*(width-1)),
+                       round((shoulder.y+.6*(elbow.y-shoulder.y))*(height-1)))
+                cv2.line(mask,start,end,255,max(3,round(span*.30)))
+            continue
         for a,b,width_fraction in ((shoulder,elbow,.52),(elbow,wrist,.42)):
             if visible(a,.40) and visible(b,.40):
                 start = (round(a.x*(width-1)),round(a.y*(height-1)))

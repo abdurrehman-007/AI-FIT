@@ -24,15 +24,20 @@ class DeCoBackend:
         from transformers import CLIPImageProcessor
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        self.resolution = (512,768)
         # Use the same VAE as the verified test and the released model.
         load = dict(base_model_path=str(checkpoint), torch_dtype=self.dtype,
                     vae_repo='stabilityai/sd-vae-ft-mse',
                     scheduler_repo='stable-diffusion-v1-5/stable-diffusion-inpainting')
         self.core = DeCoVTONPipeline.from_vton_checkpoint(local_files_only=True, **load).to(self.device)
+        self.core.vae.enable_slicing()
+        # Keep CUDA memory for garment detail. The safety checker still runs
+        # on every returned image, in float32 on CPU.
+        self.safety_device = torch.device('cpu')
         self.checker = _from_pretrained(
             StableDiffusionSafetyChecker.from_pretrained,
             'stable-diffusion-v1-5/stable-diffusion-inpainting', subfolder='safety_checker',
-            torch_dtype=self.dtype, variant='fp16', use_safetensors=True).to(self.device)
+            torch_dtype=torch.float32, variant='fp16', use_safetensors=True).to(self.safety_device)
         self.extractor = _from_pretrained(
             CLIPImageProcessor.from_pretrained,
             'stable-diffusion-v1-5/stable-diffusion-inpainting', subfolder='feature_extractor')
@@ -64,7 +69,9 @@ class DeCoBackend:
                                guidance_scale=guidance_scale, generator=generator,
                                scheduler_type='ddim', eta=1.0)
         pixels = np.stack([np.asarray(frame.convert('RGB')) for frame in results])
-        features = self.extractor(results, return_tensors='pt').pixel_values.to(device, dtype=getattr(self, 'dtype', torch.float16))
+        safety_device=getattr(self,'safety_device',device)
+        safety_dtype=torch.float32 if safety_device.type=='cpu' else getattr(self,'dtype',torch.float16)
+        features = self.extractor(results, return_tensors='pt').pixel_values.to(safety_device, dtype=safety_dtype)
         _, flags = self.checker(images=pixels, clip_input=features)
         self.last_safety_blocked = bool(any(flags))
         if self.last_safety_blocked:

@@ -68,8 +68,8 @@ def _load_deco():
         os.environ.setdefault('HF_HUB_OFFLINE', '1')
         os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
         backend_name = 'deco'
-        infer_size = DeCoBackend.resolution
-        print('Model ready: DeCo-VTON 384 x 512, 50 steps, safety checker enabled.', flush=True)
+        infer_size = pipeline.resolution
+        print(f'Model ready: DeCo-VTON {infer_size[0]} x {infer_size[1]}, 50 steps, safety checker enabled.', flush=True)
         return True
     except Exception:
         sys.path[:] = original_path
@@ -139,6 +139,7 @@ def health():
         pose_validation=preprocessor is not None,
         pose_preservation="landmark-protected inpainting and output check",
         garment_segmentation=preprocessor is not None,
+        preprocessing_version='validated-candidates-v6',
     ), 200 if pipeline is not None and preprocessor is not None and clothing_mask is not None else 503
 
 
@@ -171,27 +172,43 @@ def infer():
             if preprocessor.garment_has_person(clean_garment):
                 clean_garment = clothing_mask.garment_only(clean_garment, category)
             person, mask, crop_box, protected = clothing_mask.prepare(
-                images[0], category, infer_size, landmarks=landmarks, include_protection=True, foreground=foreground)
+                images[0], category, infer_size, landmarks=landmarks, include_protection=True,
+                foreground=foreground, garment=clean_garment)
         except ValueError as error:
             return jsonify(error=str(error)), 422
         garment = ImageOps.pad(clean_garment, infer_size, method=Image.Resampling.LANCZOS, color='white')
-        with torch.inference_mode():
-            torch.manual_seed(42)
-            generator = torch.Generator(device='cuda').manual_seed(42)
-            output = pipeline(
-                image=person, condition_image=garment, mask=mask,
-                width=infer_size[0], height=infer_size[1],
-                num_inference_steps=50, guidance_scale=2.5, generator=generator)[0]
-        if getattr(pipeline, 'last_safety_blocked', False):
-            raise OutputBlocked('The generated image could not be returned. Try a different photo or garment.')
-        output = restore_crop(output, images[0], mask, crop_box, protected=protected)
-        if category == 'upper':
-            output = clothing_mask.restore_exposed_skin(images[0], output)
-        preprocessor.check_output_pose(landmarks, output, category)
+        for attempt,seed in enumerate((42,73),1):
+            with torch.inference_mode():
+                torch.manual_seed(seed)
+                generator = torch.Generator(device='cuda').manual_seed(seed)
+                output = pipeline(
+                    image=person, condition_image=garment, mask=mask,
+                    width=infer_size[0], height=infer_size[1],
+                    num_inference_steps=50, guidance_scale=3.5 if category == 'upper' else 2.5,
+                    generator=generator)[0]
+            if getattr(pipeline, 'last_safety_blocked', False):
+                raise OutputBlocked('The generated image could not be returned. Try a different photo or garment.')
+            output = restore_crop(output, images[0], mask, crop_box, protected=protected)
+            if category == 'upper':
+                output = clothing_mask.restore_exposed_skin(images[0], output)
+            try:
+                preprocessor.check_output_pose(landmarks, output, category, original_foreground=foreground)
+                if category == 'upper':
+                    coverage=clothing_mask.check_sleeve_coverage(output,landmarks,clean_garment)
+                    if coverage.get('passed') is False:
+                        raise InputRejected('The preview shortened the full sleeves. This result was not saved. Try a different garment photo or a clearer view of your arms.')
+            except InputRejected:
+                if attempt == 2:
+                    raise
+                app.logger.info('Output structure check failed; trying the second candidate.')
+                continue
+            break
         result = io.BytesIO()
         output.save(result, format='JPEG', quality=95)
         result.seek(0)
-        return send_file(result, mimetype='image/jpeg')
+        response=send_file(result, mimetype='image/jpeg')
+        response.headers['X-AIFIT-Attempts']=str(attempt)
+        return response
     except (OutputBlocked, InputRejected) as error:
         return jsonify(error=str(error)), 422
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
@@ -216,5 +233,16 @@ def infer():
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':
+        import msvcrt
+        service_lock = (ROOT / 'instance/gpu-service.lock').open('a+b')
+        if service_lock.seek(0,2) == 0:
+            service_lock.write(b'0')
+            service_lock.flush()
+        service_lock.seek(0)
+        try:
+            msvcrt.locking(service_lock.fileno(),msvcrt.LK_NBLCK,1)
+        except OSError:
+            raise SystemExit('The AI-FIT GPU service is already running or loading.')
     initialize()
     app.run(host='127.0.0.1', port=8001, threaded=True)

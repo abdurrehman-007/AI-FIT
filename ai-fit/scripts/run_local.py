@@ -21,6 +21,17 @@ env.setdefault('PUBLIC_URL', web_url)
 # local_windows.py expects PROJECT/CatVTON.
 logs = ROOT / 'instance'
 logs.mkdir(exist_ok=True)
+if os.name == 'nt':
+    import msvcrt
+    startup_lock = (logs / 'launcher.lock').open('a+b')
+    if startup_lock.seek(0,2) == 0:
+        startup_lock.write(b'0')
+        startup_lock.flush()
+    startup_lock.seek(0)
+    try:
+        msvcrt.locking(startup_lock.fileno(),msvcrt.LK_NBLCK,1)
+    except OSError:
+        raise SystemExit('AI-FIT startup is already in progress. Wait for its ready message.')
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def ready(url):

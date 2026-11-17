@@ -5,6 +5,43 @@ from PIL import Image
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import local_windows as service
 class LocalWindowsTests(unittest.TestCase):
+    def test_output_quality_retry_returns_only_a_passing_candidate(self):
+        from preprocessing import InputRejected
+        def photo():
+            stream=io.BytesIO();Image.new('RGB',(128,128)).save(stream,format='PNG');stream.seek(0);return stream
+        for errors,expected_calls,expected_status in [([InputRejected('bad pose'),{}],2,200),
+                                                     ([InputRejected('bad pose')]*2,2,422),
+                                                     ([{}],1,200)]:
+            prep=Mock();prep.validate_person.return_value=([object()]*33,None)
+            prep.clean_garment.return_value=Image.new('RGB',(128,128),'white')
+            prep.garment_has_person.return_value=False
+            prep.check_output_pose.side_effect=errors
+            masker=Mock();masker.prepare.return_value=(Image.new('RGB',(128,128)),Image.new('L',(128,128),255),(0,0,128,128),Image.new('L',(128,128)))
+            pipeline=Mock(return_value=[Image.new('RGB',(128,128),'blue')]);pipeline.last_safety_blocked=False
+            with patch.object(service,'pipeline',pipeline),patch.object(service,'preprocessor',prep),patch.object(service,'clothing_mask',masker),patch.object(service.torch,'Generator',return_value=Mock()):
+                response=service.app.test_client().post('/infer',headers={'Authorization':'Bearer '+service.KEY},
+                    data={'person':(photo(),'p.png'),'garment':(photo(),'g.png'),'category':'overall'})
+            self.assertEqual(response.status_code,expected_status)
+            self.assertEqual(pipeline.call_count,expected_calls)
+            self.assertFalse(service.lock.locked())
+            if expected_status==200:
+                self.assertEqual(response.headers['X-AIFIT-Attempts'],str(expected_calls))
+
+    def test_safety_rejection_is_not_retried(self):
+        def photo():
+            stream=io.BytesIO();Image.new('RGB',(128,128)).save(stream,format='PNG');stream.seek(0);return stream
+        prep=Mock();prep.validate_person.return_value=([object()]*33,None)
+        prep.clean_garment.return_value=Image.new('RGB',(128,128),'white');prep.garment_has_person.return_value=False
+        masker=Mock();masker.prepare.return_value=(Image.new('RGB',(128,128)),Image.new('L',(128,128),255),(0,0,128,128),Image.new('L',(128,128)))
+        pipeline=Mock(return_value=[Image.new('RGB',(128,128),'blue')]);pipeline.last_safety_blocked=True
+        with patch.object(service,'pipeline',pipeline),patch.object(service,'preprocessor',prep),patch.object(service,'clothing_mask',masker),patch.object(service.torch,'Generator',return_value=Mock()):
+            response=service.app.test_client().post('/infer',headers={'Authorization':'Bearer '+service.KEY},
+                data={'person':(photo(),'p.png'),'garment':(photo(),'g.png'),'category':'overall'})
+        self.assertEqual(response.status_code,422)
+        self.assertEqual(pipeline.call_count,1)
+        prep.check_output_pose.assert_not_called()
+        self.assertFalse(service.lock.locked())
+
     def test_health_without_cuda_is_503(self):
         with patch.object(service,'pipeline',None),patch.object(service.torch.cuda,'is_available',return_value=False):
             response=service.app.test_client().get('/health')
